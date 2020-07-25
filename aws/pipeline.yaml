@@ -1,0 +1,319 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: CI/CD Pipeline for Python Lambda using Chalice
+Parameters:
+  GitHubOwner:
+    Type: String
+  GitHubRepo:
+    Type: String
+  GitHubToken:
+    Type: String
+  Name:
+    Type: String
+    AllowedPattern: "[a-z-].+"
+Resources:
+  ArtifactStore:
+    Properties:
+      AccessControl: Private
+      LifecycleConfiguration:
+        Rules:
+        - ExpirationInDays: 7
+          Status: Enabled
+      Tags:
+        - Key: "owner"
+          Value: !Ref Name
+    Type: AWS::S3::Bucket
+  ApplicationBucket:
+    Properties:
+      AccessControl: Private
+      LifecycleConfiguration:
+        Rules:
+          - ExpirationInDays: 7
+            Status: Enabled
+      Tags:
+        - Key: "owner"
+          Value: !Ref Name
+    Type: AWS::S3::Bucket
+  DynamoTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: "key"
+          AttributeType: "S"
+      KeySchema:
+        - AttributeName: "key"
+          KeyType: "HASH"
+      BillingMode: PAY_PER_REQUEST
+      Tags:
+        - Key: "owner"
+          Value: !Ref Name
+  DynamoTableName:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Description: name of Dynamo DB Table
+      Name: !Join ['-' ,[!Ref Name, 'dynamodb-tablename']]
+      Type: String
+      Value: !Ref DynamoTable
+  DynamoTableArn:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Description: arn of Dynamo DB Table
+      Name: !Join ['-' ,[!Ref Name, 'dynamodb-arn']]
+      Type: String
+      Value: !GetAtt 'DynamoTable.Arn'
+  InputQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      Tags:
+        - Key: "owner"
+          Value: !Ref Name
+  InputQueueName:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Description: name of input queue
+      Name: !Join ['-' ,[!Ref Name, 'sqs-queuename']]
+      Type: String
+      Value: !GetAtt 'InputQueue.QueueName'
+  InputQueueArn:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Description: arn of input queue
+      Name: !Join ['-' ,[!Ref Name, 'sqs-arn']]
+      Type: String
+      Value: !GetAtt 'InputQueue.Arn'
+  CloudFormationRole:
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action:
+          - sts:AssumeRole
+          Effect: Allow
+          Principal:
+            Service: cloudformation.amazonaws.com
+      Policies:
+      - PolicyDocument:
+          Statement:
+          - Action:
+            - iam:GetRole
+            - iam:PassRole
+            - iam:CreateRole
+            - iam:DeleteRole
+            - iam:AttachRolePolicy
+            - iam:DetachRolePolicy
+            - iam:PutRolePolicy
+            - iam:DeleteRolePolicy
+            - iam:UpdateAssumeRolePolicy
+            - cloudformation:*
+            - lambda:*
+            - s3:*
+            Effect: Allow
+            Resource:
+            - "*"
+        PolicyName: CloudFormationPermissions
+    Type: AWS::IAM::Role
+  CodeBuild:
+    Properties:
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        EnvironmentVariables:
+        - Name: INPUT_QUEUE_NAME
+          Value: !GetAtt 'InputQueue.QueueName'
+        - Name: APP_S3_BUCKET
+          Value: !Ref ApplicationBucket
+
+        - Name: LAMBDA_ENV_DYNAMO_TABLE_NAME
+          Value: !Ref DynamoTable
+        - Name: LAMBDA_ENV_DEPLOY_REGION
+          Value: !Ref 'AWS::Region'
+
+        - Name: POLICY_ENV_INPUT_QUEUE_ARN
+          Value: !GetAtt 'InputQueue.Arn'
+        - Name: POLICY_ENV_DYNAMO_TABLE_ARN
+          Value: !GetAtt 'DynamoTable.Arn'
+
+        Image: amazonlinux:latest
+        PrivilegedMode: 'true'
+        Type: LINUX_CONTAINER
+      ServiceRole: !GetAtt 'CodeBuildRole.Arn'
+      Source:
+        BuildSpec: aws/codebuild.yaml
+        Type: CODEPIPELINE
+      TimeoutInMinutes: 15
+      Tags:
+        - Key: "owner"
+          Value: !Ref Name
+    Type: AWS::CodeBuild::Project
+
+  CodeTest:
+    Properties:
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/python:3.6.5
+        PrivilegedMode: 'true'
+        Type: LINUX_CONTAINER
+      ServiceRole: !GetAtt 'CodeBuildRole.Arn'
+      Source:
+        BuildSpec: aws/codetest.yaml
+        Type: CODEPIPELINE
+      TimeoutInMinutes: 15
+      Tags:
+        - Key: "owner"
+          Value: !Ref Name
+    Type: AWS::CodeBuild::Project
+  CodeBuildRole:
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action:
+          - sts:AssumeRole
+          Effect: Allow
+          Principal:
+            Service: codebuild.amazonaws.com
+      Policies:
+      - PolicyDocument:
+          Statement:
+          - Action:
+            - s3:*
+            Effect: Allow
+            Resource:
+            - "*"
+          - Action:
+            - logs:*
+            Effect: Allow
+            Resource:
+              - "*"
+        PolicyName: CodeBuildServicePermissions
+    Type: AWS::IAM::Role
+  CodePipeline:
+    Properties:
+      ArtifactStore:
+        Location: !Ref ArtifactStore
+        Type: S3
+      Name: !Ref Name
+      RestartExecutionOnUpdate: 'false'
+      RoleArn: !GetAtt 'CodePipelineRole.Arn'
+      Stages:
+      - Actions:
+        - ActionTypeId:
+            Category: Source
+            Owner: ThirdParty
+            Provider: GitHub
+            Version: '1'
+          Configuration:
+            Branch: 'master'
+            OAuthToken: !Ref GitHubToken
+            Owner: !Ref GitHubOwner
+            PollForSourceChanges: true
+            Repo: !Ref GitHubRepo
+          Name: SourceCode
+          OutputArtifacts:
+          - Name: repository
+        Name: Source
+      - Actions:
+        - ActionTypeId:
+            Category: Build
+            Owner: AWS
+            Provider: CodeBuild
+            Version: '1'
+          Configuration:
+            ProjectName: !Ref CodeTest
+          InputArtifacts:
+          - Name: repository
+          Name: CodeBuild
+        Name: Test
+      - Actions:
+        - ActionTypeId:
+            Category: Build
+            Owner: AWS
+            Provider: CodeBuild
+            Version: '1'
+          Configuration:
+            ProjectName: !Ref CodeBuild
+          InputArtifacts:
+          - Name: repository
+          Name: CodeBuild
+          OutputArtifacts:
+          - Name: config
+        Name: Build
+      - Actions:
+        - ActionTypeId:
+            Category: Deploy
+            Owner: AWS
+            Version: 1
+            Provider: CloudFormation
+          InputArtifacts:
+          - Name: config
+          Name: CreateChangeSet
+          Configuration:
+            ActionMode: CHANGE_SET_REPLACE
+            ChangeSetName: !Sub "${Name}ChangeSet"
+            RoleArn: !GetAtt 'CloudFormationRole.Arn'
+            Capabilities: CAPABILITY_IAM
+            StackName: !Sub "${Name}-service"
+            TemplatePath: config::transformed.yaml
+          RunOrder: 1
+        - ActionTypeId:
+            Category: Deploy
+            Owner: AWS
+            Version: 1
+            Provider: CloudFormation
+          Configuration:
+            StackName: !Sub "${Name}-service"
+            ActionMode: CHANGE_SET_EXECUTE
+            ChangeSetName: !Sub "${Name}ChangeSet"
+            OutputFileName: StackOutputs.json
+          Name: ExecuteChangeSet
+          OutputArtifacts:
+          - Name: deploy
+          RunOrder: 2
+        Name: Deploy
+    Type: AWS::CodePipeline::Pipeline
+  CodePipelineRole:
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action:
+          - sts:AssumeRole
+          Effect: Allow
+          Principal:
+            Service: codepipeline.amazonaws.com
+      Policies:
+      - PolicyDocument:
+          Statement:
+          - Action:
+            - s3:ListBucket
+            - s3:GetObject
+            - s3:GetObjectVersion
+            - s3:PutObject
+            Effect: Allow
+            Resource:
+            - "*"
+          - Action:
+            - codebuild:BatchGetBuilds
+            - codebuild:StartBuild
+            Effect: Allow
+            Resource:
+            - "*"
+          - Action:
+            - lambda:InvokeFunction
+            - lambda:ListFunctions
+            Effect: Allow
+            Resource:
+            - "*"
+          - Action:
+            - cloudwatch:*
+            - iam:PassRole
+            Effect: Allow
+            Resource:
+            - "*"
+          - Action:
+            - cloudformation:*
+            - iam:PassRole
+            Effect: Allow
+            Resource:
+            - "*"
+        PolicyName: CodePipepineServicePermissions
+    Type: AWS::IAM::Role

@@ -1,0 +1,29 @@
+version: 0.2
+phases:
+  install:
+    commands:
+      - echo '`date` Preparing environment'
+      - yum update -y
+      - yum groupinstall "Development Tools" -y
+      - yum install -y python3-pip python3 python3-setuptools python3-devel git aws-cli
+      - python3 -m venv v-env && . v-env/bin/activate && pip install --upgrade pip && pip install -r requirements/requirements.txt && deactivate
+
+      - echo '`date` Preparing build'
+      - mkdir vendor
+      - cp -R my_package vendor
+      - cp -R v-env/lib/python3.7/site-packages/. vendor
+      - cp -R v-env/lib64/python3.7/site-packages/. vendor
+      - echo 'Size of build' $(du -sm --exclude=./v-env .) 'MB'
+      - find . -name "*.pyc" -exec rm -f {} \;
+      - find ./vendor  -name 'boto3' -prune -type d -exec rm -rf {} \;
+      - find ./vendor  -name 'botocore' -prune -type d -exec rm -rf {} \;
+      - echo 'Size of build after cleaning' $(du -sm --exclude=./v-env .) 'MB'
+
+      - echo '`date` Packaging build'
+      - . v-env/bin/activate && python config_generator.py && chalice package /tmp/packaged && deactivate
+      - aws cloudformation package --template-file /tmp/packaged/sam.json --s3-bucket ${APP_S3_BUCKET} --output-template-file transformed.yaml
+
+artifacts:
+  type: zip
+  files:
+    - transformed.yaml
